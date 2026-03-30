@@ -27,7 +27,7 @@
 
         apps.default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/main";
+          program = "${self.packages.${system}.default}/bin/ipk-omega-l4";
         };
 
         devShells.default = pkgs.mkShell {
