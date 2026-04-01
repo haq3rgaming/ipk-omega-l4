@@ -1,10 +1,10 @@
 SHELL := /bin/sh
 
-BINARY := ipk-L4-scan
+BINARY := ipk-omega-l4
 GO ?= go
 CGO_ENABLED ?= 0
 
-.PHONY: all NixDevShellName clean
+.PHONY: all NixDevShellName test clean
 
 all: $(BINARY)
 
@@ -14,6 +14,9 @@ NixDevShellName:
 $(BINARY):
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) build -o $(BINARY) .
 	chmod +x $(BINARY)
+
+test: $(BINARY)
+	$(GO) test .
 
 clean:
 	rm -f $(BINARY)
