@@ -13,7 +13,7 @@ FILES_TO_PACK := $(PACKED_FILES) $(PACKAGE_FILES)
 all: $(BINARY)
 
 NixDevShellName:
-    @echo "go"
+	@echo "go"
 
 $(BINARY):
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) build -o $(BINARY) .
@@ -24,6 +24,7 @@ test: $(BINARY)
 
 clean:
 	rm -f $(BINARY)
+	rm -f $(XLOGIN).zip
 
 pack: clean
-    zip -r $(XLOGIN).zip $(FILES_TO_PACK)
+	zip -r $(XLOGIN).zip $(FILES_TO_PACK)
