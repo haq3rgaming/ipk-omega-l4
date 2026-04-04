@@ -12,17 +12,18 @@ import (
 
 func scanTCP(ctx context.Context, ip net.IP, port int, timeout time.Duration, localIP net.IP) string {
 	debugf("scanTCP: target=%s:%d", ip.String(), port)
-	first := doTCPDial(ctx, ip, port, timeout, localIP)
+	first := doTCPDial(ctx, ip, port, timeout, localIP) // Perform the first TCP dial attempt
 	if first == nil {
 		debugf("scanTCP: %s:%d open", ip.String(), port)
 		return "open"
 	}
 
-	if isConnRefused(first) {
+	if isConnRefused(first) { // If the error indicates connection refused, we can conclude the port is closed
 		debugf("scanTCP: %s:%d closed (refused)", ip.String(), port)
 		return "closed"
 	}
 
+	// Repeat the scan if the first attempt resulted in a timeout
 	if isTimeoutErr(first) {
 		debugf("scanTCP: %s:%d timeout, retrying", ip.String(), port)
 		second := doTCPDial(ctx, ip, port, timeout, localIP)
@@ -40,16 +41,18 @@ func scanTCP(ctx context.Context, ip net.IP, port int, timeout time.Duration, lo
 		}
 	}
 
+	// If we got an error that is not a timeout or connection refused, treat it as filtered
 	debugf("scanTCP: %s:%d filtered (default)", ip.String(), port)
 	return "filtered"
 }
 
 func doTCPDial(ctx context.Context, ip net.IP, port int, timeout time.Duration, localIP net.IP) error {
-	dialer := net.Dialer{Timeout: timeout}
+	dialer := net.Dialer{Timeout: timeout} // Create a net.Dialer with the specified timeout
 	if localIP != nil {
 		dialer.LocalAddr = &net.TCPAddr{IP: localIP}
 	}
 
+	// Attempt to establish a TCP connection to the target IP and port using the dialer
 	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), strconv.Itoa(port)))
 	if err != nil {
 		return err
@@ -60,7 +63,7 @@ func doTCPDial(ctx context.Context, ip net.IP, port int, timeout time.Duration, 
 
 func scanUDP(ctx context.Context, ip net.IP, port int, timeout time.Duration, localIP net.IP) string {
 	debugf("scanUDP: target=%s:%d", ip.String(), port)
-	dialer := net.Dialer{Timeout: timeout}
+	dialer := net.Dialer{Timeout: timeout} // Create a net.Dialer with the specified timeout for UDP
 	if localIP != nil {
 		dialer.LocalAddr = &net.UDPAddr{IP: localIP}
 	}
@@ -80,10 +83,12 @@ func scanUDP(ctx context.Context, ip net.IP, port int, timeout time.Duration, lo
 	}
 	defer conn.Close()
 
+	// Set a deadline for the connection to ensure we don't wait indefinitely
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return "open"
 	}
 
+	// Send empty payload to the target UDP port
 	_, err = conn.Write([]byte{0x00})
 	if err != nil {
 		if isConnRefused(err) {
@@ -99,6 +104,7 @@ func scanUDP(ctx context.Context, ip net.IP, port int, timeout time.Duration, lo
 	}
 
 	buf := make([]byte, 1)
+	// Attempt to read from the connection
 	_, err = conn.Read(buf)
 	if err != nil {
 		if isConnRefused(err) {
@@ -117,12 +123,12 @@ func scanUDP(ctx context.Context, ip net.IP, port int, timeout time.Duration, lo
 	return "open"
 }
 
-func isTimeoutErr(err error) bool {
+func isTimeoutErr(err error) bool { // Check if the error is a timeout error
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
-func isConnRefused(err error) bool {
+func isConnRefused(err error) bool { // Check if the error is a connection refused error
 	if errors.Is(err, syscall.ECONNREFUSED) {
 		return true
 	}

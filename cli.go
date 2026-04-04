@@ -15,7 +15,7 @@ func parseArgs(args []string) (config, error) {
 	ifaceWithoutValue := false
 	debugf("parseArgs: raw args=%v", args)
 
-	for i := 0; i < len(args); i++ {
+	for i := 0; i < len(args); i++ { // Iterate over command-line arguments and update config struct
 		arg := args[i]
 		switch arg {
 		case "-h", "--help":
@@ -31,7 +31,7 @@ func parseArgs(args []string) (config, error) {
 			if i+1 >= len(args) {
 				return cfg, errors.New("missing value for -t")
 			}
-			ports, err := parsePorts(args[i+1])
+			ports, err := parsePorts(args[i+1]) // Parse TCP ports, returns slice of ints and error if any
 			if err != nil {
 				return cfg, fmt.Errorf("invalid TCP ports: %w", err)
 			}
@@ -41,7 +41,7 @@ func parseArgs(args []string) (config, error) {
 			if i+1 >= len(args) {
 				return cfg, errors.New("missing value for -u")
 			}
-			ports, err := parsePorts(args[i+1])
+			ports, err := parsePorts(args[i+1]) // Parse UDP ports, returns slice of ints and error if any
 			if err != nil {
 				return cfg, fmt.Errorf("invalid UDP ports: %w", err)
 			}
@@ -51,7 +51,7 @@ func parseArgs(args []string) (config, error) {
 			if i+1 >= len(args) {
 				return cfg, errors.New("missing value for -w")
 			}
-			ms, err := strconv.Atoi(args[i+1])
+			ms, err := strconv.Atoi(args[i+1]) // Parse timeout value in milliseconds, returns int and error if any
 			if err != nil || ms <= 0 {
 				return cfg, errors.New("-w must be a positive integer in milliseconds")
 			}
@@ -68,11 +68,12 @@ func parseArgs(args []string) (config, error) {
 		}
 	}
 
-	if cfg.help {
+	if cfg.help { // If help flag is set, print usage and exit
 		debugf("parseArgs: help requested")
 		return cfg, nil
 	}
 
+	// If -i is provided without a value and no other required fields are set, assume interface listing mode
 	if ifaceWithoutValue && cfg.iface == "" && cfg.host == "" && len(cfg.tcpPorts) == 0 && len(cfg.udpPorts) == 0 && cfg.timeout == defaultTimeout {
 		cfg.listIfacesOnly = true
 		debugf("parseArgs: interface list mode selected")
@@ -97,12 +98,12 @@ func parseArgs(args []string) (config, error) {
 }
 
 func parsePorts(raw string) ([]int, error) {
-	if strings.TrimSpace(raw) == "" {
+	if strings.TrimSpace(raw) == "" { // Check for empty port list
 		return nil, errors.New("empty port list")
 	}
 
-	parts := strings.Split(raw, ",")
-	seen := map[int]struct{}{}
+	parts := strings.Split(raw, ",") // Split raw port string by commas to handle multiple ports and ranges
+	seen := map[int]struct{}{}       // Use a map to track seen ports and avoid duplicates
 
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
@@ -110,7 +111,7 @@ func parsePorts(raw string) ([]int, error) {
 			return nil, errors.New("empty port element")
 		}
 
-		if strings.Contains(p, "-") {
+		if strings.Contains(p, "-") { // Check for port range specified with a hyphen, e.g. "20-25"
 			bounds := strings.Split(p, "-")
 			if len(bounds) != 2 {
 				return nil, fmt.Errorf("invalid range: %s", p)
@@ -145,6 +146,7 @@ func parsePorts(raw string) ([]int, error) {
 		seen[port] = struct{}{}
 	}
 
+	// Combine seen ports into a slice and sort them for consistent output, however due to the async nature of scanning, the order of output may not be guaranteed
 	ports := make([]int, 0, len(seen))
 	for port := range seen {
 		ports = append(ports, port)
@@ -153,7 +155,7 @@ func parsePorts(raw string) ([]int, error) {
 	return ports, nil
 }
 
-func printUsage() {
+func printUsage() { // Print usage information for the command-line tool
 	fmt.Println("Usage:")
 	fmt.Println("  ./ipk-L4-scan -i INTERFACE [-u PORTS] [-t PORTS] HOST [-w TIMEOUT] [-h | --help]")
 	fmt.Println("  ./ipk-L4-scan -i")
@@ -161,7 +163,7 @@ func printUsage() {
 	fmt.Println("  ./ipk-L4-scan --help")
 }
 
-func printActiveInterfaces() error {
+func printActiveInterfaces() error { // List all active network interfaces on the system, returns error if any occurs
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return err

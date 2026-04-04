@@ -13,7 +13,7 @@ var (
 	debugOnce    sync.Once
 )
 
-func isDebugEnabled() bool {
+func isDebugEnabled() bool { // Check if debug mode is enabled by reading the IPK_DEBUG environment variable once
 	debugOnce.Do(func() {
 		v := strings.TrimSpace(strings.ToLower(os.Getenv("IPK_DEBUG")))
 		debugEnabled = v == "1" || v == "true" || v == "yes" || v == "on"
@@ -21,7 +21,7 @@ func isDebugEnabled() bool {
 	return debugEnabled
 }
 
-func debugf(format string, args ...any) {
+func debugf(format string, args ...any) { // Print debug messages if debug mode is enabled
 	if !isDebugEnabled() {
 		return
 	}

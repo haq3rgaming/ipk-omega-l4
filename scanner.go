@@ -13,9 +13,9 @@ import (
 
 func runScanner(cfg config) error {
 	debugf("runScanner: starting iface=%s host=%s timeout=%s", cfg.iface, cfg.host, cfg.timeout)
-	v4Local, v6Local, err := interfaceIPs(cfg.iface)
+	v4Local, v6Local, err := interfaceIPs(cfg.iface) // Get local IPv4 and IPv6 addresses for the specified interface
 	if err != nil {
-		return err
+		return err // If error occurs while retrieving interface IPs, return the error
 	}
 	debugf("runScanner: local addresses v4=%d v6=%d", len(v4Local), len(v6Local))
 
@@ -28,10 +28,10 @@ func runScanner(cfg config) error {
 	}
 	debugf("runScanner: resolved %d IPs", len(ips))
 
-	tasks := make(chan scanTask, 512)
-	var outMu sync.Mutex
+	tasks := make(chan scanTask, 512) // Buffered channel to hold scan tasks, allowing workers to process tasks concurrently without blocking the main goroutine
+	var outMu sync.Mutex              // Mutex to synchronize output to prevent interleaving of lines and ensure thread-safe writes to stdout
 
-	workers := 200
+	workers := 200 // Number of concurrent worker goroutines to perform scanning
 	var wg sync.WaitGroup
 	for range workers {
 		wg.Add(1)
@@ -70,7 +70,7 @@ func runScanner(cfg config) error {
 		}
 	}
 
-outer:
+outer: // Iterate over each resolved IP address and each specified port, submitting scan tasks to the workers
 	for _, ip := range ips {
 		for _, port := range cfg.tcpPorts {
 			select {
@@ -98,7 +98,7 @@ outer:
 	close(tasks)
 	wg.Wait()
 
-	if ctx.Err() != nil {
+	if ctx.Err() != nil { // Interrupt signal received eg. Ctrl+C
 		debugf("runScanner: interrupted by signal")
 		return nil
 	}
@@ -109,7 +109,7 @@ outer:
 
 func resolveHost(ctx context.Context, host string) ([]net.IP, error) {
 	debugf("resolveHost: host=%s", host)
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host) // Resolve the host to a list of IP addresses using the default resolver
 	if err != nil {
 		return nil, err
 	}
@@ -119,6 +119,8 @@ func resolveHost(ctx context.Context, host string) ([]net.IP, error) {
 	return ips, nil
 }
 
+// Get local IPv4 and IPv6 addresses for the specified interface
+// Ensure the interface is active and has usable addresses, otherwise return an error
 func interfaceIPs(ifaceName string) ([]net.IP, []net.IP, error) {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
@@ -159,7 +161,7 @@ func interfaceIPs(ifaceName string) ([]net.IP, []net.IP, error) {
 }
 
 func selectLocalIP(target net.IP, v4 []net.IP, v6 []net.IP) net.IP {
-	if target.IsLoopback() {
+	if target.IsLoopback() { // If the target IP is a loopback address, prefer local loopback addresses for scanning
 		if target.To4() != nil {
 			for _, ip := range v4 {
 				if ip.IsLoopback() {
