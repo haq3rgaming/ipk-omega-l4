@@ -1,3 +1,3 @@
-module ipk-omega-l4
+module ipk-L4-scan
 
 go 1.24.4
