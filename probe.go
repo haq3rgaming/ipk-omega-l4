@@ -19,12 +19,14 @@ import (
 func scanTCP(ctx context.Context, ip net.IP, port int, timeout time.Duration, localIP net.IP) string {
 	debugf("scanTCP: target=%s:%d", ip.String(), port)
 
-	if ip4 := ip.To4(); ip4 == nil {
-		debugf("scanTCP: %s:%d filtered (tcp syn scan currently supports ipv4 only)", ip.String(), port)
-		return "filtered"
+	var state string
+	var err error
+	if ip.To4() != nil {
+		state, err = scanTCPSYNv4(ctx, ip, port, timeout, localIP)
+	} else {
+		state, err = scanTCPSYNv6(ctx, ip, port, timeout, localIP)
 	}
 
-	state, err := scanTCPSYNv4(ctx, ip.To4(), port, timeout, localIP)
 	if err != nil {
 		debugf("scanTCP: %s:%d filtered (syn scan failed: %v)", ip.String(), port, err)
 		return "filtered"
@@ -106,6 +108,79 @@ func scanTCPSYNv4(ctx context.Context, targetIP net.IP, targetPort int, timeout 
 	}
 }
 
+func scanTCPSYNv6(ctx context.Context, targetIP net.IP, targetPort int, timeout time.Duration, localIP net.IP) (string, error) {
+	if targetIP == nil || targetIP.To16() == nil || targetIP.To4() != nil {
+		return "", errors.New("target is not a valid IPv6 address")
+	}
+
+	srcIP, err := resolveSourceIPv6(targetIP, localIP) // Resolve the source IP for the raw socket
+	if err != nil {
+		return "", err
+	}
+
+	fd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_TCP) // Create a raw socket for sending TCP packets
+	if err != nil {
+		return "", err
+	}
+	defer syscall.Close(fd)
+
+	if err := syscall.Bind(fd, &syscall.SockaddrInet6{Addr: ipTo16Array(srcIP)}); err != nil { // Bind the socket to the source IP
+		return "", err
+	}
+
+	tv := syscall.NsecToTimeval(timeout.Nanoseconds()) // Set timeout for receiving responses
+	if err := syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv); err != nil {
+		return "", err
+	}
+
+	srcPort, seq, err := randomProbeValues() // Generate random source port and sequence number for the TCP SYN packet
+	if err != nil {
+		return "", err
+	}
+
+	tcpHeader := makeTCPHeader(srcIP, targetIP, srcPort, uint16(targetPort), seq)
+	if tcpHeader == nil {
+		return "", errors.New("failed to build tcp syn segment")
+	}
+	if err := syscall.Sendto(fd, tcpHeader, 0, &syscall.SockaddrInet6{Addr: ipTo16Array(targetIP), Port: targetPort}); err != nil {
+		return "", err
+	}
+
+	deadline := time.Now().Add(timeout)
+	buf := make([]byte, 1500)
+	for {
+		if err := ctx.Err(); err != nil { // Check for context cancellation
+			return "filtered", nil
+		}
+		if time.Now().After(deadline) { // Check for timeout
+			return "filtered", nil
+		}
+
+		n, _, err := syscall.Recvfrom(fd, buf, 0) // Receive responses and handle errors
+		if err != nil {
+			if errors.Is(err, syscall.EINTR) { // Interrupted system call, retry receiving
+				continue
+			}
+			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) { // Timeout occurred, treat as filtered
+				return "filtered", nil
+			}
+			return "", err
+		}
+
+		flags, ok := parseTCPFlagsIPv6(buf[:n], targetIP, srcIP, uint16(targetPort), srcPort)
+		if !ok {
+			continue
+		}
+
+		if flags&tcpFlagRST != 0 {
+			return "closed", nil
+		}
+		if flags&(tcpFlagSYN|tcpFlagACK) == (tcpFlagSYN | tcpFlagACK) {
+			return "open", nil
+		}
+	}
+}
+
 const (
 	tcpFlagSYN = 0x02
 	tcpFlagRST = 0x04
@@ -145,17 +220,27 @@ func randomProbeValues() (uint16, uint32, error) {
 }
 
 func makeTCPHeader(srcIP net.IP, dstIP net.IP, srcPort uint16, dstPort uint16, seq uint32) []byte {
-	ip4 := &layers.IPv4{SrcIP: srcIP.To4(), DstIP: dstIP.To4(), Protocol: layers.IPProtocolTCP} // Create an IPv4 layer
-	tcp := &layers.TCP{ // Create a TCP layer with SYN flag set
+	var ip gopacket.NetworkLayer
+	if srcIP.To4() != nil && dstIP.To4() != nil {
+		ip = &layers.IPv4{SrcIP: srcIP.To4(), DstIP: dstIP.To4(), Protocol: layers.IPProtocolTCP}
+	} else if srcIP.To16() != nil && dstIP.To16() != nil {
+		ip = &layers.IPv6{SrcIP: srcIP, DstIP: dstIP, NextHeader: layers.IPProtocolTCP}
+	} else {
+		return nil // Unsupported IP version
+	}
+
+	tcp := &layers.TCP{
 		SrcPort: layers.TCPPort(srcPort),
 		DstPort: layers.TCPPort(dstPort),
 		Seq:     seq,
 		SYN:     true,
 		Window:  64240,
 	}
-	_ = tcp.SetNetworkLayerForChecksum(ip4)
+	if err := tcp.SetNetworkLayerForChecksum(ip); err != nil {
+		return nil
+	}
 
-	buf := gopacket.NewSerializeBuffer() // Serialize the layers into a byte slice
+	buf := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true}
 	if err := gopacket.SerializeLayers(buf, opts, tcp); err != nil {
 		return nil
@@ -288,4 +373,74 @@ func isConnRefused(err error) bool { // Check if the error is a connection refus
 	return strings.Contains(msg, "connection refused") ||
 		strings.Contains(msg, "actively refused") ||
 		strings.Contains(msg, "port unreachable")
+}
+
+func resolveSourceIPv6(targetIP net.IP, localIP net.IP) (net.IP, error) {
+	if localIP != nil {
+		if ip16 := localIP.To16(); ip16 != nil && localIP.To4() == nil {
+			return ip16, nil
+		}
+		return nil, errors.New("local IP is not IPv6")
+	}
+
+	conn, err := net.DialUDP("udp6", nil, &net.UDPAddr{IP: targetIP, Port: 53})
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || addr.IP == nil || addr.IP.To16() == nil || addr.IP.To4() != nil {
+		return nil, errors.New("unable to determine local IPv6 address")
+	}
+	return addr.IP, nil
+}
+
+func ipTo16Array(ip net.IP) [16]byte {
+	ip16 := ip.To16()
+	if ip16 == nil {
+		return [16]byte{}
+	}
+	var out [16]byte
+	copy(out[:], ip16)
+	return out
+}
+
+func parseTCPFlagsIPv6(pkt []byte, srcIP net.IP, dstIP net.IP, srcPort uint16, dstPort uint16) (byte, bool) {
+	packet := gopacket.NewPacket(pkt, layers.LayerTypeIPv6, gopacket.NoCopy)
+	// Get layers
+	ipLayer := packet.Layer(layers.LayerTypeIPv6)
+	tcpLayer := packet.Layer(layers.LayerTypeTCP)
+	if ipLayer == nil || tcpLayer == nil {
+		return 0, false
+	}
+
+	ipv6, ok := ipLayer.(*layers.IPv6)
+	if !ok {
+		return 0, false
+	}
+	tcp, ok := tcpLayer.(*layers.TCP)
+	if !ok {
+		return 0, false
+	}
+
+	if !ipv6.SrcIP.Equal(srcIP) || !ipv6.DstIP.Equal(dstIP) {
+		return 0, false
+	}
+	if uint16(tcp.SrcPort) != srcPort || uint16(tcp.DstPort) != dstPort {
+		return 0, false
+	}
+
+	// Extract TCP flags and return them as a byte
+	var flags byte
+	if tcp.SYN {
+		flags |= tcpFlagSYN
+	}
+	if tcp.RST {
+		flags |= tcpFlagRST
+	}
+	if tcp.ACK {
+		flags |= tcpFlagACK
+	}
+	return flags, true
 }
