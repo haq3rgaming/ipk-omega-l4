@@ -38,61 +38,61 @@ func scanTCPSYNv4(ctx context.Context, targetIP net.IP, targetPort int, timeout 
 		return "", errors.New("target is not a valid IPv4 address")
 	}
 
-	srcIP, err := resolveSourceIPv4(targetIP, localIP)
+	srcIP, err := resolveSourceIPv4(targetIP, localIP) // Resolve the source IP for the raw socket
 	if err != nil {
 		return "", err
 	}
 
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_TCP)
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_TCP) // Create a raw socket for sending TCP packets
 	if err != nil {
 		return "", err
 	}
 	defer syscall.Close(fd)
 
-	if err := syscall.Bind(fd, &syscall.SockaddrInet4{Addr: ipTo4Array(srcIP)}); err != nil {
+	if err := syscall.Bind(fd, &syscall.SockaddrInet4{Addr: ipTo4Array(srcIP)}); err != nil { // Bind the socket to the source IP
 		return "", err
 	}
 
-	tv := syscall.NsecToTimeval(timeout.Nanoseconds())
+	tv := syscall.NsecToTimeval(timeout.Nanoseconds()) // Set timeout for receiving responses
 	if err := syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv); err != nil {
 		return "", err
 	}
 
-	srcPort, seq, err := randomProbeValues()
+	srcPort, seq, err := randomProbeValues() // Generate random source port and sequence number for the TCP SYN packet
 	if err != nil {
 		return "", err
 	}
 
-	tcpHeader := makeTCPHeader(srcIP, targetIP, srcPort, uint16(targetPort), seq)
+	tcpHeader := makeTCPHeader(srcIP, targetIP, srcPort, uint16(targetPort), seq) // Build the TCP SYN packet
 	if tcpHeader == nil {
 		return "", errors.New("failed to build tcp syn segment")
 	}
-	if err := syscall.Sendto(fd, tcpHeader, 0, &syscall.SockaddrInet4{Addr: ipTo4Array(targetIP), Port: targetPort}); err != nil {
+	if err := syscall.Sendto(fd, tcpHeader, 0, &syscall.SockaddrInet4{Addr: ipTo4Array(targetIP), Port: targetPort}); err != nil { // Send built packet
 		return "", err
 	}
 
 	deadline := time.Now().Add(timeout)
 	buf := make([]byte, 1500)
 	for {
-		if err := ctx.Err(); err != nil {
+		if err := ctx.Err(); err != nil { // Check for context cancellation
 			return "filtered", nil
 		}
-		if time.Now().After(deadline) {
+		if time.Now().After(deadline) { // Check for timeout
 			return "filtered", nil
 		}
 
-		n, _, err := syscall.Recvfrom(fd, buf, 0)
+		n, _, err := syscall.Recvfrom(fd, buf, 0) // Receive responses and handle errors
 		if err != nil {
-			if errors.Is(err, syscall.EINTR) {
+			if errors.Is(err, syscall.EINTR) { // Interrupted system call, retry receiving
 				continue
 			}
-			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) { // Timeout occurred, treat as filtered
 				return "filtered", nil
 			}
 			return "", err
 		}
 
-		flags, ok := parseTCPFlagsIPv4(buf[:n], targetIP, srcIP, uint16(targetPort), srcPort)
+		flags, ok := parseTCPFlagsIPv4(buf[:n], targetIP, srcIP, uint16(targetPort), srcPort) // Parse received packet
 		if !ok {
 			continue
 		}
@@ -135,7 +135,7 @@ func resolveSourceIPv4(targetIP net.IP, localIP net.IP) (net.IP, error) {
 
 func randomProbeValues() (uint16, uint32, error) {
 	var b [6]byte
-	if _, err := io.ReadFull(rand.Reader, b[:]); err != nil {
+	if _, err := io.ReadFull(rand.Reader, b[:]); err != nil { // Generate random bytes for source port and sequence number
 		return 0, 0, err
 	}
 
@@ -145,8 +145,8 @@ func randomProbeValues() (uint16, uint32, error) {
 }
 
 func makeTCPHeader(srcIP net.IP, dstIP net.IP, srcPort uint16, dstPort uint16, seq uint32) []byte {
-	ip4 := &layers.IPv4{SrcIP: srcIP.To4(), DstIP: dstIP.To4(), Protocol: layers.IPProtocolTCP}
-	tcp := &layers.TCP{
+	ip4 := &layers.IPv4{SrcIP: srcIP.To4(), DstIP: dstIP.To4(), Protocol: layers.IPProtocolTCP} // Create an IPv4 layer
+	tcp := &layers.TCP{ // Create a TCP layer with SYN flag set
 		SrcPort: layers.TCPPort(srcPort),
 		DstPort: layers.TCPPort(dstPort),
 		Seq:     seq,
@@ -155,7 +155,7 @@ func makeTCPHeader(srcIP net.IP, dstIP net.IP, srcPort uint16, dstPort uint16, s
 	}
 	_ = tcp.SetNetworkLayerForChecksum(ip4)
 
-	buf := gopacket.NewSerializeBuffer()
+	buf := gopacket.NewSerializeBuffer() // Serialize the layers into a byte slice
 	opts := gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true}
 	if err := gopacket.SerializeLayers(buf, opts, tcp); err != nil {
 		return nil
@@ -165,6 +165,7 @@ func makeTCPHeader(srcIP net.IP, dstIP net.IP, srcPort uint16, dstPort uint16, s
 
 func parseTCPFlagsIPv4(pkt []byte, srcIP net.IP, dstIP net.IP, srcPort uint16, dstPort uint16) (byte, bool) {
 	packet := gopacket.NewPacket(pkt, layers.LayerTypeIPv4, gopacket.NoCopy)
+	// Get layers
 	ipLayer := packet.Layer(layers.LayerTypeIPv4)
 	tcpLayer := packet.Layer(layers.LayerTypeTCP)
 	if ipLayer == nil || tcpLayer == nil {
@@ -187,6 +188,7 @@ func parseTCPFlagsIPv4(pkt []byte, srcIP net.IP, dstIP net.IP, srcPort uint16, d
 		return 0, false
 	}
 
+	// Extract TCP flags and return them as a byte
 	var flags byte
 	if tcp.SYN {
 		flags |= tcpFlagSYN
