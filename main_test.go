@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"syscall"
 	"testing"
 	"time"
@@ -135,6 +136,10 @@ func TestParseArgsErrors(t *testing.T) {
 }
 
 func TestScanTCPOpen(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("raw-socket SYN scan test requires root privileges")
+	}
+
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen failed: %v", err)

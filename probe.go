@@ -2,63 +2,212 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 )
 
 func scanTCP(ctx context.Context, ip net.IP, port int, timeout time.Duration, localIP net.IP) string {
 	debugf("scanTCP: target=%s:%d", ip.String(), port)
-	first := doTCPDial(ctx, ip, port, timeout, localIP) // Perform the first TCP dial attempt
-	if first == nil {
-		debugf("scanTCP: %s:%d open", ip.String(), port)
-		return "open"
+
+	if ip4 := ip.To4(); ip4 == nil {
+		debugf("scanTCP: %s:%d filtered (tcp syn scan currently supports ipv4 only)", ip.String(), port)
+		return "filtered"
 	}
 
-	if isConnRefused(first) { // If the error indicates connection refused, we can conclude the port is closed
-		debugf("scanTCP: %s:%d closed (refused)", ip.String(), port)
-		return "closed"
+	state, err := scanTCPSYNv4(ctx, ip.To4(), port, timeout, localIP)
+	if err != nil {
+		debugf("scanTCP: %s:%d filtered (syn scan failed: %v)", ip.String(), port, err)
+		return "filtered"
 	}
-
-	// Repeat the scan if the first attempt resulted in a timeout
-	if isTimeoutErr(first) {
-		debugf("scanTCP: %s:%d timeout, retrying", ip.String(), port)
-		second := doTCPDial(ctx, ip, port, timeout, localIP)
-		if second == nil {
-			debugf("scanTCP: %s:%d open on retry", ip.String(), port)
-			return "open"
-		}
-		if isConnRefused(second) {
-			debugf("scanTCP: %s:%d closed on retry", ip.String(), port)
-			return "closed"
-		}
-		if isTimeoutErr(second) {
-			debugf("scanTCP: %s:%d filtered (timeout twice)", ip.String(), port)
-			return "filtered"
-		}
-	}
-
-	// If we got an error that is not a timeout or connection refused, treat it as filtered
-	debugf("scanTCP: %s:%d filtered (default)", ip.String(), port)
-	return "filtered"
+	debugf("scanTCP: %s:%d %s (syn scan)", ip.String(), port, state)
+	return state
 }
 
-func doTCPDial(ctx context.Context, ip net.IP, port int, timeout time.Duration, localIP net.IP) error {
-	dialer := net.Dialer{Timeout: timeout} // Create a net.Dialer with the specified timeout
-	if localIP != nil {
-		dialer.LocalAddr = &net.TCPAddr{IP: localIP}
+func scanTCPSYNv4(ctx context.Context, targetIP net.IP, targetPort int, timeout time.Duration, localIP net.IP) (string, error) {
+	if targetIP == nil || targetIP.To4() == nil {
+		return "", errors.New("target is not a valid IPv4 address")
 	}
 
-	// Attempt to establish a TCP connection to the target IP and port using the dialer
-	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), strconv.Itoa(port)))
+	srcIP, err := resolveSourceIPv4(targetIP, localIP)
 	if err != nil {
-		return err
+		return "", err
 	}
-	_ = conn.Close()
-	return nil
+
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_TCP)
+	if err != nil {
+		return "", err
+	}
+	defer syscall.Close(fd)
+
+	if err := syscall.Bind(fd, &syscall.SockaddrInet4{Addr: ipTo4Array(srcIP)}); err != nil {
+		return "", err
+	}
+
+	tv := syscall.NsecToTimeval(timeout.Nanoseconds())
+	if err := syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv); err != nil {
+		return "", err
+	}
+
+	srcPort, seq, err := randomProbeValues()
+	if err != nil {
+		return "", err
+	}
+
+	tcpHeader := makeTCPHeader(srcIP, targetIP, srcPort, uint16(targetPort), seq)
+	if tcpHeader == nil {
+		return "", errors.New("failed to build tcp syn segment")
+	}
+	if err := syscall.Sendto(fd, tcpHeader, 0, &syscall.SockaddrInet4{Addr: ipTo4Array(targetIP), Port: targetPort}); err != nil {
+		return "", err
+	}
+
+	deadline := time.Now().Add(timeout)
+	buf := make([]byte, 1500)
+	for {
+		if err := ctx.Err(); err != nil {
+			return "filtered", nil
+		}
+		if time.Now().After(deadline) {
+			return "filtered", nil
+		}
+
+		n, _, err := syscall.Recvfrom(fd, buf, 0)
+		if err != nil {
+			if errors.Is(err, syscall.EINTR) {
+				continue
+			}
+			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+				return "filtered", nil
+			}
+			return "", err
+		}
+
+		flags, ok := parseTCPFlagsIPv4(buf[:n], targetIP, srcIP, uint16(targetPort), srcPort)
+		if !ok {
+			continue
+		}
+
+		if flags&tcpFlagRST != 0 {
+			return "closed", nil
+		}
+		if flags&(tcpFlagSYN|tcpFlagACK) == (tcpFlagSYN | tcpFlagACK) {
+			return "open", nil
+		}
+	}
+}
+
+const (
+	tcpFlagSYN = 0x02
+	tcpFlagRST = 0x04
+	tcpFlagACK = 0x10
+)
+
+func resolveSourceIPv4(targetIP net.IP, localIP net.IP) (net.IP, error) {
+	if localIP != nil {
+		if ip4 := localIP.To4(); ip4 != nil {
+			return ip4, nil
+		}
+		return nil, errors.New("local IP is not IPv4")
+	}
+
+	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: targetIP, Port: 53})
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || addr.IP == nil || addr.IP.To4() == nil {
+		return nil, errors.New("unable to determine local IPv4 address")
+	}
+	return addr.IP.To4(), nil
+}
+
+func randomProbeValues() (uint16, uint32, error) {
+	var b [6]byte
+	if _, err := io.ReadFull(rand.Reader, b[:]); err != nil {
+		return 0, 0, err
+	}
+
+	srcPort := uint16(32768 + (binary.BigEndian.Uint16(b[0:2]) % (65535 - 32768)))
+	seq := binary.BigEndian.Uint32(b[2:6])
+	return srcPort, seq, nil
+}
+
+func makeTCPHeader(srcIP net.IP, dstIP net.IP, srcPort uint16, dstPort uint16, seq uint32) []byte {
+	ip4 := &layers.IPv4{SrcIP: srcIP.To4(), DstIP: dstIP.To4(), Protocol: layers.IPProtocolTCP}
+	tcp := &layers.TCP{
+		SrcPort: layers.TCPPort(srcPort),
+		DstPort: layers.TCPPort(dstPort),
+		Seq:     seq,
+		SYN:     true,
+		Window:  64240,
+	}
+	_ = tcp.SetNetworkLayerForChecksum(ip4)
+
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true}
+	if err := gopacket.SerializeLayers(buf, opts, tcp); err != nil {
+		return nil
+	}
+	return buf.Bytes()
+}
+
+func parseTCPFlagsIPv4(pkt []byte, srcIP net.IP, dstIP net.IP, srcPort uint16, dstPort uint16) (byte, bool) {
+	packet := gopacket.NewPacket(pkt, layers.LayerTypeIPv4, gopacket.NoCopy)
+	ipLayer := packet.Layer(layers.LayerTypeIPv4)
+	tcpLayer := packet.Layer(layers.LayerTypeTCP)
+	if ipLayer == nil || tcpLayer == nil {
+		return 0, false
+	}
+
+	ipv4, ok := ipLayer.(*layers.IPv4)
+	if !ok {
+		return 0, false
+	}
+	tcp, ok := tcpLayer.(*layers.TCP)
+	if !ok {
+		return 0, false
+	}
+
+	if !ipv4.SrcIP.Equal(srcIP) || !ipv4.DstIP.Equal(dstIP) {
+		return 0, false
+	}
+	if uint16(tcp.SrcPort) != srcPort || uint16(tcp.DstPort) != dstPort {
+		return 0, false
+	}
+
+	var flags byte
+	if tcp.SYN {
+		flags |= tcpFlagSYN
+	}
+	if tcp.RST {
+		flags |= tcpFlagRST
+	}
+	if tcp.ACK {
+		flags |= tcpFlagACK
+	}
+	return flags, true
+}
+
+func ipTo4Array(ip net.IP) [4]byte {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return [4]byte{}
+	}
+	var out [4]byte
+	copy(out[:], ip4)
+	return out
 }
 
 func scanUDP(ctx context.Context, ip net.IP, port int, timeout time.Duration, localIP net.IP) string {
